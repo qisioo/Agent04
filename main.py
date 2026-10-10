@@ -92,6 +92,9 @@ def input_optimize_node(state: SoftwareDevState) -> dict:
         logger.info(step_msg)
         update_dict["intention"] = "software_dev"
         update_dict["refined_requirement"] = refined_req
+        # ✅新增：新的一轮开发指令到来时重置bug修复计数
+        # 修复"fix_iteration跨对话累积"缺陷：三次锁死只作用于本次指令内部，不影响下一次对话继续开发
+        update_dict["fix_iteration"] = 0
         update_dict["step_log"].append(step_msg)
     else:
         step_msg = "输入预处理：识别为普通对话，跳转闲聊应答节点"

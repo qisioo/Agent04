@@ -36,6 +36,8 @@ class SoftwareDevState(BaseModel):
     """代码文件列表 [{file_name:str, content:str}]"""
     dev_notes: List[str] = Field(default_factory=list)
     """开发备注信息"""
+    code_file_paths: List[str] = Field(default_factory=list)
+    """代码落盘路径列表，供用户查看运行"""
 
     # ========== 测试工程师输出 ==========
     test_case_doc: Optional[str] = None
@@ -52,6 +54,11 @@ class SoftwareDevState(BaseModel):
     fix_iteration: int = 0   # ✅新增：bug修复迭代计数器
     """bug修复循环迭代计数，防止无限循环"""
     is_finished: bool = False
+
+    # ✅新增：代码版本号对比，区分"当前代码是否已测试"
+    # 修复"修完bug后不重新测试、项目经理复用旧测试报告反复判定有bug"的调度缺陷
+    code_version: int = 0  # 代码版本号，程序员每次产出/修复代码时+1
+    tested_code_version: int = -1  # 已测试过的代码版本号，-1表示尚未测试过任何代码
 
     # ========== 对外最终输出 ==========
     final_output: Optional[str] = None
