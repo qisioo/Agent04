@@ -10,6 +10,8 @@ from state import SoftwareDevState
 from utils.llm_client import safe_llm_invoke_sync
 from utils.logger import logger
 from utils.code_sandbox import run_python_code
+from utils.context_manager import trim_chat_history, limit_text
+from utils.code_inspect import extract_skeleton, find_bug_locations, extract_relevant_code
 
 # 修复模式内部最大重试次数：修复后真实运行失败，反馈错误让LLM重修的次数
 MAX_FIX_ATTEMPTS = 2
@@ -34,31 +36,48 @@ def developer_node(state: SoftwareDevState) -> dict:
 
     if is_fix_mode:
         logger.info("程序员Agent进入Bug修复模式，读取旧代码与测试报告")
-        old_code_text = ""
-        for item in old_code_list:
-            old_code_text += f"\n==== 文件 {item['file_name']} ====\n{item['content']}\n"
+        # =========【增量Diff：构建精简上下文，替代完整旧代码，省token】=========
+        code_section_title = "【原有全部代码】"
+        code_section = ""
+        if old_code_list:
+            old_code = old_code_list[0]["content"]
+            skeleton = extract_skeleton(old_code)
+            loc = find_bug_locations(old_code, test_report)
+            relevant = extract_relevant_code(old_code, loc["funcs"], loc["lines"])
+            if skeleton and relevant:
+                code_section_title = "【代码信息（增量Diff精简上下文：结构骨架 + bug相关代码）】"
+                code_section = (
+                    f"【代码结构骨架（全文件结构预览，未展开函数体）】\n{skeleton}\n\n"
+                    f"【bug相关代码（完整函数体+附近行，重点修复对象）】\n{relevant}\n"
+                )
+                logger.info(f"增量Diff：已定位bug位置 行号={loc['lines']} 函数={loc['funcs']}，使用精简上下文")
+            else:
+                for item in old_code_list:
+                    code_section += f"\n==== 文件 {item['file_name']} ====\n{item['content']}\n"
+                logger.info("增量Diff：无法定位bug位置，回退完整旧代码")
+        # ========================================================================
 
+        # =========【上下文分区精细化管理：修复模式挂载"项目目标摘要+代码区+测试区+技术栈"】=========
+        # 不带完整PRD/架构省token；但带轻量"项目目标与设计摘要"，防止多轮修复循环中模型失忆、
+        # 忘了程序要干什么、整体框架。这是长期记忆与工作记忆的分层。
         base_fix_prompt = f"""
 你是Python开发工程师，负责修复下面代码中的Bug。
 
-【PRD需求】
-{prd}
-
-【架构方案】
-{arch_doc}
-
 【技术栈】
-{tech_stack}
+{limit_text(tech_stack, 2000)}
 
-【原有全部代码】
-{old_code_text}
+【项目目标与设计摘要】（程序要干什么、总体框架，修复时保持整体方向不跑偏）
+{limit_text(state.project_brief, 800)}
+
+{code_section_title}
+{code_section}
 
 【测试工程师Bug报告】
-{test_report}
+{limit_text(test_report, 4000)}
 
 修复要求：
 1. 必须【实际修改代码】把测试报告指出的Bug修好，修复后的代码必须能正常运行通过；
-2. 只修改Bug相关位置，不要改动无关的正常逻辑；
+2. 只修改Bug相关位置，不要改动无关的正常逻辑；未展示的函数体请按原有逻辑原样保留；
 3. 严禁原样返回！修复后的代码必须与修复前存在实际差异，否则视为修复无效；
 4. 输出完整可运行的Python代码（在旧代码基础上修改Bug处）；
 5. 返回结果格式JSON，key为 file_name 和 content；
@@ -126,13 +145,13 @@ def developer_node(state: SoftwareDevState) -> dict:
         dev_prompt = f"""
 你是Python开发工程师，根据PRD、架构文档、技术栈，输出完整可运行Python程序。
 【PRD需求】
-{prd}
+{limit_text(prd, 4000)}
 
 【架构方案】
-{arch_doc}
+{limit_text(arch_doc, 4000)}
 
 【技术栈选型】
-{tech_stack}
+{limit_text(tech_stack, 2000)}
 
 要求：
 1.代码完整可直接运行，增加必要注释，处理异常；
@@ -213,9 +232,9 @@ def developer_node(state: SoftwareDevState) -> dict:
 
     logger.info(log_msg)
 
-    # ==========【新增：方案一摘要写入chat_history】==========
-    new_chat_history = state.chat_history + [("assistant", summary_text)]
-    # ========================================================
+    # ==========【新增：方案一摘要写入chat_history（滑动窗口，防无限膨胀）】==========
+    new_chat_history = trim_chat_history(state.chat_history + [("assistant", summary_text)])
+    # ================================================================================
 
     # ==========【新增：代码版本号递增，供项目经理判断"是否需要重新测试"】==========
     new_code_version = state.code_version + 1

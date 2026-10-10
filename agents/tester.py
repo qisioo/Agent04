@@ -11,6 +11,7 @@ from state import SoftwareDevState
 from utils.llm_client import safe_llm_invoke_sync
 from utils.logger import logger
 from utils.code_sandbox import run_python_code
+from utils.context_manager import trim_chat_history, limit_text
 
 
 def tester_node(state: SoftwareDevState) -> dict:
@@ -43,10 +44,10 @@ def tester_node(state: SoftwareDevState) -> dict:
 参照PRD需求文档、架构方案，对下面代码做测试分析与审查。
 
 【PRD需求】
-{prd}
+{limit_text(prd, 4000)}
 
 【架构方案】
-{arch_doc}
+{limit_text(arch_doc, 3000)}
 
 【待审查全部代码】
 {code_all_text}
@@ -101,10 +102,10 @@ def tester_node(state: SoftwareDevState) -> dict:
     success_log = "测试工程师：真实运行验证、代码审查、测试用例、测试报告生成完成"
     logger.info(success_log)
 
-    # ==========【新增：方案一摘要写入chat_history】==========
+    # ==========【新增：方案一摘要写入chat_history（滑动窗口，防无限膨胀）】==========
     summary_text = "【测试工程师完成测试】完成真实运行验证与代码审查，完整测试用例、报告保存在state对应字段。"
-    new_chat_history = state.chat_history + [("assistant", summary_text)]
-    # ========================================================
+    new_chat_history = trim_chat_history(state.chat_history + [("assistant", summary_text)])
+    # ================================================================================
 
     return {
         "test_case_doc": test_case_doc,

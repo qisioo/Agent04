@@ -13,7 +13,10 @@ from state import SoftwareDevState
 from utils.llm_client import safe_llm_invoke_sync
 from utils.logger import logger
 from utils.checkpoint_manager import get_checkpointer, build_graph_config, resolve_thread_id
+from utils.context_manager import trim_chat_history
 from langgraph.graph import StateGraph, END
+from langgraph.types import interrupt, Command
+from langgraph.errors import GraphInterrupt
 from agents.project_manager import project_manager_node, route_by_project_manager
 from agents.product_manager import product_manager_node
 from agents.architect import architect_node
@@ -56,7 +59,7 @@ def input_optimize_node(state: SoftwareDevState) -> dict:
         logger.error(err_msg)
         # 异常：读取旧历史，拼接user+assistant错误提示
         return {
-            "chat_history": state.chat_history + [("user", raw_input), ("assistant", f"系统异常：{err_msg}")],
+            "chat_history": trim_chat_history(state.chat_history + [("user", raw_input), ("assistant", f"系统异常：{err_msg}")]),
             "step_log": [err_msg],
             "error_messages": [err_msg],
             "is_finished": True,
@@ -70,7 +73,7 @@ def input_optimize_node(state: SoftwareDevState) -> dict:
         logger.error(parse_err)
         # 异常：读取旧历史，拼接user+assistant错误提示
         return {
-            "chat_history": state.chat_history + [("user", raw_input), ("assistant", parse_err)],
+            "chat_history": trim_chat_history(state.chat_history + [("user", raw_input), ("assistant", parse_err)]),
             "step_log": [parse_err],
             "error_messages": [parse_err],
             "is_finished": True,
@@ -80,8 +83,8 @@ def input_optimize_node(state: SoftwareDevState) -> dict:
     is_dev_task = resp_json.get("is_dev_task", False)
     refined_req = resp_json.get("refined_requirement", "")
 
-    # =========【修改点1：手动读取旧chat_history拼接，不再返回增量片段】=========
-    new_chat = state.chat_history + [("user", raw_input)]
+    # =========【修改点1：手动读取旧chat_history拼接（滑动窗口，防无限膨胀）】=========
+    new_chat = trim_chat_history(state.chat_history + [("user", raw_input)])
     update_dict = {
         "chat_history": new_chat,
         "step_log": []
@@ -113,13 +116,14 @@ def simple_chat_node(state: SoftwareDevState) -> dict:
     AI回答手动拼接进完整chat_history，结束graph流程
     """
     logger.info("进入闲聊应答节点，读取完整对话历史生成回答")
-    # chat_history格式 [(role,content)]，直接喂给llm
-    ai_content = safe_llm_invoke_sync(state.chat_history)
+    # chat_history格式 [(role,content)]，滑动窗口截断后喂给llm，防token无限膨胀
+    chat_for_llm = trim_chat_history(state.chat_history)
+    ai_content = safe_llm_invoke_sync(chat_for_llm)
     if not ai_content:
         ai_content = "抱歉，当前模型暂时无法给出回答。"
 
-    # =========【修改点4：读取旧历史，拼接AI完整返回列表】=========
-    full_new_chat = state.chat_history + [("assistant", ai_content)]
+    # =========【修改点4：读取旧历史，拼接AI完整返回列表（滑动窗口）】=========
+    full_new_chat = trim_chat_history(state.chat_history + [("assistant", ai_content)])
     return {
         "chat_history": full_new_chat,
         "final_output": f"[LLM原生问答回复]\n{ai_content}",
@@ -142,6 +146,51 @@ def route_after_input_optimize(state: SoftwareDevState) -> str:
         return END
 
 
+def architecture_review_node(state: SoftwareDevState) -> dict:
+    """
+    架构评审中断节点（human-in-the-loop）
+    架构师写完架构后暂停，把架构方案交给用户确认：
+    - 首次执行到 interrupt() 会暂停图，返回架构方案给用户
+    - resume 后读取用户输入：确认→进开发；提优化意见→回架构师重新生成
+    """
+    user_feedback = interrupt({
+        "type": "architecture_review",
+        "message": "架构师已完成架构设计与技术栈选型，请确认是否符合需求，或提出优化意见（回复\"继续\"即按此架构进入开发）",
+        "architecture_doc": state.architecture_doc,
+        "tech_stack": state.tech_stack_decision,
+        "project_brief": state.project_brief,
+    })
+    fb = str(user_feedback or "").strip().lower().rstrip("。！!,. ")
+    confirm_prefix = ("继续", "确认", "可以", "没问题", "同意", "通过", "好", "ok", "yes", "y", "就这个")
+    is_confirm = fb == "" or fb.startswith(confirm_prefix)
+    if is_confirm:
+        # 用户确认架构 → 回到项目经理，继续进入开发
+        return {
+            "arch_review_feedback": None,
+            "current_agent": "project_manager",
+            "step_log": ["架构评审：用户确认架构，继续进入开发"]
+        }
+    # 用户提出优化意见 → 回架构师重新生成
+    return {
+        "arch_review_feedback": str(user_feedback).strip(),
+        "current_agent": "architect",
+        "step_log": [f"架构评审：用户提出优化意见，交回架构师调整。意见：{str(user_feedback).strip()[:120]}"]
+    }
+
+
+def route_after_arch_review(state: SoftwareDevState) -> str:
+    """
+    架构评审之后的条件路由
+    用户确认 → project_manager_node（继续开发）
+    用户提意见 → architect_node（重新生成架构）
+    """
+    agent_map = {
+        "architect": "architect_node",
+        "project_manager": "project_manager_node",
+    }
+    return agent_map.get(state.current_agent, END)
+
+
 def build_graph() -> StateGraph:
     """
     构建完整多Agent软件开发团队图
@@ -161,6 +210,7 @@ def build_graph() -> StateGraph:
     graph_builder.add_node("project_manager_node", project_manager_node)
     graph_builder.add_node("product_manager_node", product_manager_node)
     graph_builder.add_node("architect_node", architect_node)
+    graph_builder.add_node("architecture_review_node", architecture_review_node)  # 架构评审中断节点
     graph_builder.add_node("developer_node", developer_node)
     graph_builder.add_node("tester_node", tester_node)
 
@@ -197,9 +247,21 @@ def build_graph() -> StateGraph:
 
     # =========所有业务Agent执行完成后，统一回到项目经理节点=========
     graph_builder.add_edge("product_manager_node", "project_manager_node")
-    graph_builder.add_edge("architect_node", "project_manager_node")
+    # 架构师写完后，先进入架构评审中断节点（等用户确认/提意见），不直接回项目经理
+    graph_builder.add_edge("architect_node", "architecture_review_node")
     graph_builder.add_edge("developer_node", "project_manager_node")
     graph_builder.add_edge("tester_node", "project_manager_node")
+
+    # =========架构评审中断后按用户反馈路由：确认→项目经理继续开发；提意见→回架构师=========
+    graph_builder.add_conditional_edges(
+        "architecture_review_node",
+        route_after_arch_review,
+        {
+            "architect_node": "architect_node",
+            "project_manager_node": "project_manager_node",
+            END: END
+        }
+    )
 
     # ✅挂载检查点，开启thread_id会话记忆
     return graph_builder.compile(
@@ -211,38 +273,78 @@ def build_graph() -> StateGraph:
 app_graph = build_graph()
 
 
-def run_agent_workflow(user_input: str, thread_id: str | None = None) -> tuple[SoftwareDevState, str]:
+def run_agent_workflow(user_input: str, thread_id: str | None = None, resume_value: str | None = None) -> dict:
     """
-    对外暴露调用入口函数
+    对外暴露调用入口函数（支持human-in-the-loop中断/恢复）
     :param user_input: 用户原始输入字符串
     :param thread_id: 用户可指定会话id；不传自动生成
-    :return: (解析后的State实例, 实际使用的thread_id)
+    :param resume_value: 架构评审确认/意见；中断后携带继续执行
+    :return: dict
+        - pending=True: 流程在架构评审处中断，等待用户确认（含架构方案）
+        - pending=False: 流程正常结束，含 state 对象
     """
     used_thread_id = resolve_thread_id(thread_id)
     cfg = build_graph_config(used_thread_id)
 
-    # =========修复：区分全新会话 / 已有会话=========
-    checkpointer = app_graph.checkpointer
-    existing_checkpoint = next(checkpointer.list(cfg), None)
+    # =========体验优化：线程处于架构评审中断挂起时，用户的下一条输入自动作为恢复内容=========
+    # 无需用户手动传resume，直接发"继续"或优化意见即可恢复中断
+    if resume_value is None:
+        try:
+            snapshot = app_graph.get_state(cfg)
+            tasks = getattr(snapshot, "tasks", None) or []
+            has_pending_interrupt = any(getattr(t, "interrupts", None) for t in tasks)
+            if has_pending_interrupt:
+                resume_value = user_input
+                logger.info("检测到线程处于架构评审中断挂起，自动将用户输入作为恢复内容")
+        except Exception:
+            pass  # 状态查询失败不影响正常流程
+    # =====================================================================================
 
-    if existing_checkpoint is None:
-        # 全新会话：传入完整初始化state
-        init_state = SoftwareDevState(
-            raw_user_requirement=user_input
-        )
-        input_payload = init_state.model_dump()
-    else:
-        # 已有会话！！只传入需要更新的字段，绝对不要传入全套初始化，防止覆盖chat_history
-        input_payload = {
-            "raw_user_requirement": user_input
+    try:
+        if resume_value is not None:
+            # 中断后恢复：把用户的确认/意见通过Command(resume=...)传回图
+            result_state_dict = app_graph.invoke(Command(resume=resume_value), config=cfg)
+        else:
+            # =========区分全新会话 / 已有会话=========
+            checkpointer = app_graph.checkpointer
+            existing_checkpoint = next(checkpointer.list(cfg), None)
+            if existing_checkpoint is None:
+                init_state = SoftwareDevState(raw_user_requirement=user_input)
+                input_payload = init_state.model_dump()
+            else:
+                input_payload = {"raw_user_requirement": user_input}
+            result_state_dict = app_graph.invoke(input_payload, config=cfg)
+    except GraphInterrupt as e:
+        # 架构评审中断：返回pending状态，附架构方案，等待用户确认
+        payload = {}
+        if getattr(e, "interrupts", None):
+            payload = e.interrupts[0].value or {}
+        logger.info("流程在架构评审处中断，等待用户确认架构")
+        return {
+            "pending": True,
+            "thread_id": used_thread_id,
+            "message": payload.get("message", "架构待确认"),
+            "architecture_doc": payload.get("architecture_doc"),
+            "tech_stack": payload.get("tech_stack"),
+            "project_brief": payload.get("project_brief"),
         }
 
-    result_state_dict = app_graph.invoke(
-        input_payload,
-        config=cfg
-    )
+    # langgraph 1.x：interrupt 不抛异常，而是返回结果dict里的 __interrupt__ 字段
+    if isinstance(result_state_dict, dict) and result_state_dict.get("__interrupt__"):
+        interrupts = result_state_dict["__interrupt__"]
+        payload = interrupts[0].value if interrupts else {}
+        logger.info("流程在架构评审处中断，等待用户确认架构")
+        return {
+            "pending": True,
+            "thread_id": used_thread_id,
+            "message": payload.get("message", "架构待确认"),
+            "architecture_doc": payload.get("architecture_doc"),
+            "tech_stack": payload.get("tech_stack"),
+            "project_brief": payload.get("project_brief"),
+        }
+
     result_state = SoftwareDevState(**result_state_dict)
-    return result_state, used_thread_id
+    return {"pending": False, "state": result_state, "thread_id": used_thread_id}
 
 
 

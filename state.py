@@ -30,6 +30,10 @@ class SoftwareDevState(BaseModel):
     """系统架构设计文档"""
     tech_stack_decision: Optional[str] = None
     """技术栈选型结论"""
+    project_brief: str = ""
+    """项目目标与设计摘要（程序目的+模块划分概览），供修复/测试场景轻量携带，防模型失忆"""
+    arch_review_feedback: Optional[str] = None
+    """用户对架构方案的确认/优化意见（human-in-the-loop中断评审用）"""
 
     # ========== 程序员输出 ==========
     code_files: List[dict] = Field(default_factory=list)
