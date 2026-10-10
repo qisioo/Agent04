@@ -11,7 +11,8 @@ from state import SoftwareDevState
 from utils.llm_client import safe_llm_invoke_sync
 from utils.logger import logger
 from utils.code_sandbox import run_python_code
-from utils.context_manager import trim_chat_history, limit_text
+from utils.context_manager import trim_chat_history
+from utils.prompt_templates import build_tester_prompt, TASK_MODEL
 
 
 def tester_node(state: SoftwareDevState) -> dict:
@@ -39,47 +40,8 @@ def tester_node(state: SoftwareDevState) -> dict:
             f"标准输出: {(result.stdout or '').strip()[:800]}\n"
         )
 
-    tester_prompt = f"""
-你是资深Python测试工程师。
-参照PRD需求文档、架构方案，对下面代码做测试分析与审查。
-
-【PRD需求】
-{limit_text(prd, 4000)}
-
-【架构方案】
-{limit_text(arch_doc, 3000)}
-
-【待审查全部代码】
-{code_all_text}
-
-【⚠️真实运行验证结果（最高优先级事实依据，审查必须以此为准）】
-{run_evidence}
-
-审查规则：
-1. 以【真实运行验证结果】为最高优先级事实：运行报错/超时=必然存在bug；运行成功也不代表无逻辑问题，要继续排查。
-2. 真实运行报错时，必须把运行错误信息作为bug逐条写入测试报告。
-3. 核对代码是否完整实现PRD全部功能；
-4. 检查异常捕获、边界条件、潜在逻辑bug；
-5. 仅当真实运行成功 且 逻辑审查无问题，才可写"无bug，全部功能测试通过"。
-
-输出分为两大部分：
-# 一、测试用例 test_case_doc
-编写多条可执行测试用例，包含：测试场景、输入、预期输出。
-
-# 二、测试报告 test_report
-1. 真实运行验证结论：每个文件是否真实运行成功，报错/超时情况；
-2. 核对代码是否完整实现PRD全部功能；
-3. 检查异常捕获、边界条件、潜在逻辑bug；
-4. 如果发现bug：逐条描述bug现象、触发条件、问题位置；
-5. 如果没有bug：明确写"无bug，全部功能测试通过"。
-
-【必须】在测试报告最末尾，单独一行输出测试结论标记（不要放在其他文字里）：
-- 当真实运行成功 且 未发现任何bug时，输出：测试结论: 通过
-- 当真实运行失败 或 发现任何bug时，输出：测试结论: 存在bug
-
-直接输出正文，不要多余开场白。
-"""
-    llm_tester_result = safe_llm_invoke_sync(tester_prompt)
+    tester_prompt = build_tester_prompt(prd, arch_doc, code_all_text, run_evidence)
+    llm_tester_result = safe_llm_invoke_sync(tester_prompt, model_level=TASK_MODEL["test"])
 
     if not llm_tester_result:
         err_msg = "测试工程师：调用大模型生成测试报告失败"

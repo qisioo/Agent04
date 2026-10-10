@@ -25,13 +25,15 @@ class AgentRunResponse(BaseModel):
 
 
 @app.post("/api/agent04/run", response_model=AgentRunResponse)
-async def agent_run(req: AgentRunRequest):
+def agent_run(req: AgentRunRequest):
     """
     多Agent工作流执行接口
     - 普通闲聊：直接返回原生LLM回复，流程结束
     - 软件开发需求：驱动完整多Agent团队执行
     - 架构评审中断：流程在架构师后暂停，返回架构方案等待用户确认（code=100）
       → 用户带 thread_id + resume 再次调用继续（确认或提意见）
+    注意：本端点用普通 def（非async def），FastAPI 会在线程池中执行，
+    避免同步阻塞的 run_agent_workflow 卡死事件循环导致并发请求互相排队。
     """
     result = run_agent_workflow(
         user_input=req.user_input,

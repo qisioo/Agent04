@@ -7,6 +7,7 @@
 from state import SoftwareDevState
 from utils.llm_client import safe_llm_invoke_sync
 from utils.logger import logger
+from utils.prompt_templates import build_prd_prompt, TASK_MODEL
 
 
 def product_manager_node(state: SoftwareDevState) -> dict:
@@ -18,20 +19,8 @@ def product_manager_node(state: SoftwareDevState) -> dict:
     refined_req = state.refined_requirement
     logger.info(f"产品经理Agent开始工作，接收需求：{refined_req[:100]}...")
 
-    prd_prompt = f"""
-你是一名资深软件产品经理，根据下面用户开发需求，输出一份规范简洁的PRD产品需求文档。
-用户开发需求：
-{refined_req}
-
-PRD文档需要包含：
-1.项目概述：这个工具/程序要解决什么问题
-2.核心功能列表：逐条列出需要实现的功能
-3.输入与输出说明
-4.非功能约束：运行环境、边界、异常处理要求
-
-直接输出PRD正文，不要多余开场白，不要对话。
-"""
-    llm_prd_result = safe_llm_invoke_sync(prd_prompt)
+    prd_prompt = build_prd_prompt(refined_req)
+    llm_prd_result = safe_llm_invoke_sync(prd_prompt, model_level=TASK_MODEL["prd"])
 
     if not llm_prd_result:
         err_msg = "产品经理：调用大模型生成PRD文档失败"

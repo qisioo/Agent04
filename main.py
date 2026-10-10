@@ -14,6 +14,7 @@ from utils.llm_client import safe_llm_invoke_sync
 from utils.logger import logger
 from utils.checkpoint_manager import get_checkpointer, build_graph_config, resolve_thread_id
 from utils.context_manager import trim_chat_history
+from utils.prompt_templates import build_intent_prompt, TASK_MODEL
 from langgraph.graph import StateGraph, END
 from langgraph.types import interrupt, Command
 from langgraph.errors import GraphInterrupt
@@ -38,22 +39,8 @@ def input_optimize_node(state: SoftwareDevState) -> dict:
     raw_input = state.raw_user_requirement
     logger.info(f"输入预处理节点收到用户原始输入：{raw_input}")
 
-    intent_prompt = f"""
-你是输入意图校验处理器。
-用户原始输入：{raw_input}
-
-规则：
-任务A：判断用户输入是否属于【软件开发相关需求】。
-软件开发需求包括：写Python代码、开发工具、做接口、写项目、写测试用例、设计系统等。
-非软件开发：闲聊、问答、生活、科普、普通聊天对话等。
-
-输出严格JSON格式，**不要额外解释，不要markdown**：
-{{
-  "is_dev_task":true/false,
-  "refined_requirement":"is_dev_task=true时输出标准化开发需求；false输出空字符串"
-}}
-"""
-    llm_result = safe_llm_invoke_sync(intent_prompt)
+    intent_prompt = build_intent_prompt(raw_input)
+    llm_result = safe_llm_invoke_sync(intent_prompt, model_level=TASK_MODEL["intent"])
     if not llm_result:
         err_msg = "输入预处理调用大模型失败"
         logger.error(err_msg)
@@ -118,7 +105,7 @@ def simple_chat_node(state: SoftwareDevState) -> dict:
     logger.info("进入闲聊应答节点，读取完整对话历史生成回答")
     # chat_history格式 [(role,content)]，滑动窗口截断后喂给llm，防token无限膨胀
     chat_for_llm = trim_chat_history(state.chat_history)
-    ai_content = safe_llm_invoke_sync(chat_for_llm)
+    ai_content = safe_llm_invoke_sync(chat_for_llm, model_level=TASK_MODEL["chat"])
     if not ai_content:
         ai_content = "抱歉，当前模型暂时无法给出回答。"
 

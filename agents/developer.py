@@ -12,6 +12,7 @@ from utils.logger import logger
 from utils.code_sandbox import run_python_code
 from utils.context_manager import trim_chat_history, limit_text
 from utils.code_inspect import extract_skeleton, find_bug_locations, extract_relevant_code
+from utils.prompt_templates import build_fix_prompt, build_fix_retry_suffix, build_dev_prompt, TASK_MODEL
 
 # 修复模式内部最大重试次数：修复后真实运行失败，反馈错误让LLM重修的次数
 MAX_FIX_ATTEMPTS = 2
@@ -60,40 +61,14 @@ def developer_node(state: SoftwareDevState) -> dict:
         # =========【上下文分区精细化管理：修复模式挂载"项目目标摘要+代码区+测试区+技术栈"】=========
         # 不带完整PRD/架构省token；但带轻量"项目目标与设计摘要"，防止多轮修复循环中模型失忆、
         # 忘了程序要干什么、整体框架。这是长期记忆与工作记忆的分层。
-        base_fix_prompt = f"""
-你是Python开发工程师，负责修复下面代码中的Bug。
-
-【技术栈】
-{limit_text(tech_stack, 2000)}
-
-【项目目标与设计摘要】（程序要干什么、总体框架，修复时保持整体方向不跑偏）
-{limit_text(state.project_brief, 800)}
-
-{code_section_title}
-{code_section}
-
-【测试工程师Bug报告】
-{limit_text(test_report, 4000)}
-
-修复要求：
-1. 必须【实际修改代码】把测试报告指出的Bug修好，修复后的代码必须能正常运行通过；
-2. 只修改Bug相关位置，不要改动无关的正常逻辑；未展示的函数体请按原有逻辑原样保留；
-3. 严禁原样返回！修复后的代码必须与修复前存在实际差异，否则视为修复无效；
-4. 输出完整可运行的Python代码（在旧代码基础上修改Bug处）；
-5. 返回结果格式JSON，key为 file_name 和 content；
-{{
-  "file_name":"main.py",
-  "content":"完整的python代码字符串"
-}}
-只返回JSON，不要其他解释文本。
-"""
+        base_fix_prompt = build_fix_prompt(tech_stack, state.project_brief, code_section, code_section_title, test_report)
         dev_prompt = base_fix_prompt
 
         # =========【新增：修复后真实运行验证 + 失败反馈重修闭环】=========
         fix_attempts = 0
         run_result = None
         while True:
-            llm_dev_result = safe_llm_invoke_sync(dev_prompt)
+            llm_dev_result = safe_llm_invoke_sync(dev_prompt, model_level=TASK_MODEL["fix"])
             if not llm_dev_result:
                 err_msg = "程序员：调用大模型生成/修复代码失败"
                 logger.error(err_msg)
@@ -131,39 +106,13 @@ def developer_node(state: SoftwareDevState) -> dict:
             logger.warning(f"程序员：修复后真实运行仍失败，第{fix_attempts}次内部重试")
             # 把真实运行错误反馈给LLM，要求针对该错误再次修复
             run_error_detail = (run_result.stderr or "").strip()[:1000] or run_result.summary
-            dev_prompt = base_fix_prompt + f"""
-
-【⚠️上次修复后真实运行仍失败，必须基于下面错误继续修复】
-运行是否成功: {run_result.success}
-运行错误信息:
-{run_error_detail}
-请务必【实际修改代码】消除该运行错误，使修复后代码能正常通过运行。
-"""
+            dev_prompt = base_fix_prompt + build_fix_retry_suffix(run_result.success, run_error_detail)
         # ================================================================
     else:
         logger.info("程序员Agent全新开发模式，根据PRD与架构编写代码")
-        dev_prompt = f"""
-你是Python开发工程师，根据PRD、架构文档、技术栈，输出完整可运行Python程序。
-【PRD需求】
-{limit_text(prd, 4000)}
+        dev_prompt = build_dev_prompt(prd, arch_doc, tech_stack)
 
-【架构方案】
-{limit_text(arch_doc, 4000)}
-
-【技术栈选型】
-{limit_text(tech_stack, 2000)}
-
-要求：
-1.代码完整可直接运行，增加必要注释，处理异常；
-2.输出JSON格式，key为 file_name 和 content；
-{{
-  "file_name":"main.py",
-  "content":"完整python代码写在这里"
-}}
-只返回JSON，不要多余对话、不要markdown包裹。
-"""
-
-        llm_dev_result = safe_llm_invoke_sync(dev_prompt)
+        llm_dev_result = safe_llm_invoke_sync(dev_prompt, model_level=TASK_MODEL["dev"])
         if not llm_dev_result:
             err_msg = "程序员：调用大模型生成/修复代码失败"
             logger.error(err_msg)

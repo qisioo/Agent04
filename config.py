@@ -69,6 +69,10 @@ def _get_int_env(env_key: str, default: int):
 DEEPSEEK_API_KEY = _get_str_env("DEEPSEEK_API_KEY")
 DEEPSEEK_MODEL = _get_str_env("DEEPSEEK_MODEL")
 
+# 选填：轻量模型（用于意图识别、闲聊、格式校验、摘要等简单任务，省成本省token）
+# 不配置则退化为主模型，不影响现有单模型环境
+LIGHTWEIGHT_MODEL = _get_str_env("LIGHTWEIGHT_MODEL", default=DEEPSEEK_MODEL)
+
 # 选填：没有写在.env会使用内置默认
 MAX_ITERATIONS = _get_int_env("MAX_ITERATIONS", default=15)
 SANDBOX_TIMEOUT = _get_int_env("SANDBOX_TIMEOUT", default=60)
